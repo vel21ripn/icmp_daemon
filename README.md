@@ -11,6 +11,6 @@ average, and maximum response time, the number of the transmitted and
 received packets, the number of state changes.
 The number of test hosts is not limited.
 
-The client is fully compatible by options with check_icmp from nagios_plagins.
+The client is fully compatible by options with check_icmp from nagios_plugins.
 
 For daemon server, you can restrict the list of addresses from which requests are allowed.
