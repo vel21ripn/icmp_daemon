@@ -20,13 +20,14 @@ For daemon server, you can restrict the list of addresses from which requests ar
     make  
     make install
 
+By default  
 ping\_server install to /usr/local/bin as ping\_server  
 ping\_client install to /usr/libexec as check\_icmp\_daemon
 
 #System require
 
-sysctl -w net.ipv4.ping\_group\_range="X X"  
-sysctl -w net.ipv6.ping\_group\_range="X X"
+    sysctl net.ipv4.ping\_group\_range="X X"  
+    sysctl net.ipv6.ping\_group\_range="X X"
 
 X is numeric group-ID (see "nagios\_group=" in nagios.cfg)
 
