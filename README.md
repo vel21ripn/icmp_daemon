@@ -10,7 +10,7 @@ complete statistics about answers from host for all these queries.
 During the time between requests collected statistics on the minimum,
 average, and maximum response time, the number of the transmitted and
 received packets, the number of state changes.
-The number of test hosts is not limited.
+The number of tested hosts is not limited.
 
 The client is fully compatible by options with check\_icmp from nagios\_plugins.
 
