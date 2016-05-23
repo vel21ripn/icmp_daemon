@@ -42,13 +42,15 @@ struct ping_stat {
 /* ping */
 #define PING_MAGIC htonl(0x70696E67)
 
+union host_any {
+	struct in_addr	v4;
+	struct in6_addr v6;
+};
+
 struct ping_payload {
 	uint32_t			magic; /* ping in hex */
 	struct timespec		tm;
-	union {
-	struct in_addr		v4;
-	struct in6_addr 	v6;
-	}					host;
+	union host_any		host;
 	char				pad[0];
 } __attribute__ ((packed));
 
@@ -58,9 +60,9 @@ struct ping_host {
 
 	char				v6,hostname[63];
 	union {
-	struct sockaddr		any;
-	struct sockaddr_in	v4;
-	struct sockaddr_in6 v6;
+		struct sockaddr		any;
+		struct sockaddr_in	v4;
+		struct sockaddr_in6 v6;
 	} host;
 // async answer
 	int					cfd; // client wait answer if > 0 
@@ -90,9 +92,15 @@ struct ping_host {
 
 struct ping_acl {
 	struct sockaddr_in	host;
+	int					masklen;
 	struct ping_acl		*next;
 };
 
+struct cidr_acl {
+	union host_any		dst;
+	uint16_t			masklen,v6;
+	struct cidr_acl		*next;
+};
 
 #define MAXEVENTS 128
 #define REPLY_LEN 192
@@ -125,6 +133,7 @@ pid_t main_pid=-1;
 int icmp_socket = -1;
 int icmp6_socket = -1;
 struct ping_acl *ACL=NULL;
+struct cidr_acl *DST_ACL=NULL;
 volatile int do_work=1;
 struct ping_cmd **fd_ping = NULL;
 int n_fd_ping = 0;
@@ -174,6 +183,44 @@ struct ping_acl *acl;
     return ACL ? 1:0;
 }
 
+static inline uint32_t maskv4(int m) {
+		if(m > 32) m = 32;
+		return htonl(0xfffffffful << (32 - m));
+}
+
+static int check_dst_acl_ent(union host_any *h,struct cidr_acl *acl) {
+uint32_t m;
+
+	if(!acl->v6) {
+		m = maskv4(acl->masklen);
+		return ((h->v4.s_addr & m) == acl->dst.v4.s_addr) ? 0:1;
+	} else {
+		int i,ml = acl->masklen;
+		int ok = 0;
+		for(i=0; i < 4 && ml > 0; i++,ml-=32) {
+			m = maskv4(ml);
+			if((h->v6.s6_addr32[i] & m) != acl->dst.v6.s6_addr32[i]) 
+				break;
+			else
+				ok++;
+			if(ml <= 32) {
+				ok = 4; break;
+			}
+		}
+		return (ok == 4) ? 0:1;
+	}
+}
+
+int check_dst_acl(union host_any *h,int v6) {
+struct cidr_acl *acl;
+    for(acl=DST_ACL; acl; acl=acl->next) {
+		if(v6 != acl->v6) continue;
+		if(check_dst_acl_ent(h,acl) == 0) return 0;
+	}
+    return DST_ACL ? 1:0;
+}
+
+
 int read_pid(char *file) {
 char buf[64],*e;
 int r;
@@ -206,7 +253,11 @@ int write_pid(void) {
 		}
 	}
 	fd = creat(pid_file,0644);
-	if(fd < 0) return 1;
+	if(fd < 0) {
+		fprintf(stderr,"Cant create PID file %s : %s\n",
+						pid_file,strerror(errno));
+		return 1;
+	}
 	snprintf(buf,sizeof(buf)-1,"%d\n",getpid());
 	write(fd,buf,strlen(buf));
 	pid_file_created = 1;
@@ -823,7 +874,11 @@ int p_l,p_i,p_t,n,no,ret = 0;
 		    struct ping_host *old;
 
 			stbuf[0] = 0;
-
+			if(check_dst_acl(&ph->data->host,ph->v6)) {
+				ping_total_cmd_err++;
+				snprintf(stbuf,sizeof(stbuf)-1,"Deny by acl %s\n",ph->hostname);
+				ping_host_free(ph);
+			} else {
 		    old = ping_host_find(ph);
 			if(!old) {
 				ping_total_cmd_err++;
@@ -853,6 +908,7 @@ int p_l,p_i,p_t,n,no,ret = 0;
 						snprintf(stbuf,sizeof(stbuf),"ERR %s; out of memory or bad FD\n",ph->hostname);
 					}
 				}
+			}
 		    if(stbuf[0]) {
 				send(nc,stbuf,strlen(stbuf),0);
 				no = 0;
@@ -868,13 +924,14 @@ int p_l,p_i,p_t,n,no,ret = 0;
 /************************************************************************/
 
 void usage(void) {
-	printf("ping_server [-4kD] [-d level] [-P pidfile] [-b addr:port{127.0.0.1:19988}] [-a ip,...,ip ]\n");
+	printf("ping_server [-4kD] [-d level] [-P pidfile] [-b addr:port{127.0.0.1:19988}] [-a ip,...,ip ] [-A ip[v6][/masklen][,ip[v6][/masklen]...]\n");
 printf(
 "	-4	- no ipv6\n"
 "	-k	- kill daemon using pidfile\n"
 "	-D	- no daemon\n"
 "	-b	- listen address:port (ipv4 only)\n"
-"	-a	- ACL for request (ipv4 only)\n"
+"	-a	- ACL for client requests (ipv4 only)\n"
+"	-A	- ACL for destination requests (v4/v6)\n"
 "Debug level:\n"
 "	DBG_CMD		0x01 	DBG_NET		0x02\n"
 "	DBG_HOST	0x04	DBG_EVENT	0x08\n"
@@ -889,20 +946,76 @@ printf(
 static char *parse_host_port(struct sockaddr_in *addr,char *str) {
 char *p,*e;
 int r;
+e = strchr(str,',');
+if(e) *e = 0;
 p = strchr(str,':');
 if(p) *p = 0;
 bzero(addr,sizeof(*addr));
 addr->sin_family = AF_INET;
 r = inet_pton(AF_INET,str,&addr->sin_addr);
-if(p) *p++ = ':';
-if(r < 0) return NULL;
-if(p) {
-	addr->sin_port = htons(strtol(p,&e,10) & 0xffff);
-	return e;
+if(p) *p = ':';
+if(r < 0) {
+		if(e) *e = ',';
+		return NULL;
 }
-p = str;
-while(*p && *p != ',') p++;
-return p;
+if(p) {
+	char *en;
+	addr->sin_port = htons(strtol(p,&en,10) & 0xffff);
+	if(en && !*en) {
+		if(e) *e = ',';
+		return NULL;
+	}
+}
+if(e) *e = ',';
+
+return e ? e : str + strlen(str);
+}
+
+static char *cidr_acl_parse(struct cidr_acl *acl,char *str) {
+char *p,*e;
+int r;
+
+e = strchr(str,',');
+if(e) *e = 0;
+
+p = strchr(str,'/');
+if(p) *p = 0;
+
+bzero((char *)&acl->dst,sizeof(acl->dst));
+r = 0;
+if(inet_pton(AF_INET,str,&acl->dst.v4.s_addr)) {
+	acl->v6 = 0;
+	r = 1;
+} else {
+	bzero((char *)&acl->dst,sizeof(acl->dst));
+	if(inet_pton(AF_INET6,str,&acl->dst.v6.s6_addr)) {
+		acl->v6 = 1;
+		r = 1;
+	}
+}
+if(p) *p = '/';
+
+if(!r) {
+	fprintf(stderr,"Bad acl addr %s\n",str);
+	if(e)  *e = ',';
+	return NULL;
+}
+
+if(p) {
+	acl->masklen = atoi(p+1);
+	if(acl->v6 && acl->masklen > 128) acl->masklen=128;
+	if(!acl->v6 && acl->masklen > 32) acl->masklen=32;
+} else
+	acl->masklen = acl->v6 ? 128:32;
+
+if(check_dst_acl_ent(&acl->dst,acl)) {
+	fprintf(stderr,"Bad acl addr/mask %s\n",str);
+    return NULL;
+}
+
+if(e) *e = ',';
+
+return e ? e : str + strlen(str);
 }
 
 int get_next_event(struct itimerspec *its,int efd) {
@@ -1310,7 +1423,7 @@ int main(int argc, char *argv[])
     caddr.sin_port = htons(19988);
     srandom(getpid());
 
-    while((c=getopt(argc,argv,"4kDd:b:a:P:")) != -1) {
+    while((c=getopt(argc,argv,"4kDd:b:a:A:P:")) != -1) {
 	switch(c) {
 	    case 'a':
 		    {
@@ -1323,7 +1436,7 @@ int main(int argc, char *argv[])
 				acl->next = ACL;
 				ACL = acl;
 				if(!*cmd) break;
-				cmd = parse_host_port(&addr,cmd);
+				cmd = parse_host_port(&addr,cmd+1);
 			}
 			if(*cmd) {
 				fprintf(stderr,"Bad addr %s\n",optarg);
@@ -1331,6 +1444,23 @@ int main(int argc, char *argv[])
 			}
 		    }
 	            break;
+	    case 'A':
+		    {
+			struct cidr_acl dst;
+			char *cmd = cidr_acl_parse(&dst,optarg);
+			while(cmd && (*cmd == ',' || !*cmd)) {
+				struct cidr_acl *acl = calloc(1,sizeof(struct cidr_acl));
+				*acl = dst;
+				acl->next = DST_ACL;
+				DST_ACL = acl;
+				if(!*cmd) break;
+				cmd = cidr_acl_parse(&dst,cmd+1);
+			}
+			if(!cmd || *cmd) {
+				exit(1);
+			}
+		    }
+			break;
 	    case 'b':
 		    {
 			char *cmd = parse_host_port(&caddr,optarg);
