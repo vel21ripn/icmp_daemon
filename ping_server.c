@@ -773,10 +773,10 @@ int err = 0;
 		strcpy(ph->reply,"OK ");
 		ping_host_status(ph,ph->reply+3,REPLY_LEN-4,long_timer(rtv));
 	}
-	if(abs(d2 < 100))
+	if(abs(d2 < 250))
 			d2 = 0;
 		else
-			ping_log(DBG_CRIT,"d2 - d1 %" PRIi64 "\n",d2);
+			ping_log(DBG_CRIT,"Host %s rto %" PRIi64 " d2  %" PRIi64 "\n",ph->hostname,ph->rto,d2);
 
 	ping_log(DBG_NET2,"host %s rto %" PRIi64 " delta %" PRIi64 "\n",
 				ph->hostname,ph->rto,d2);
@@ -932,6 +932,7 @@ printf(
 "	-b	- listen address:port (ipv4 only)\n"
 "	-a	- ACL for client requests (ipv4 only)\n"
 "	-A	- ACL for destination requests (v4/v6)\n"
+"	-x	- ACL list for destination requests (v4/v6)\n"
 "Debug level:\n"
 "	DBG_CMD		0x01 	DBG_NET		0x02\n"
 "	DBG_HOST	0x04	DBG_EVENT	0x08\n"
@@ -971,7 +972,7 @@ if(e) *e = ',';
 return e ? e : str + strlen(str);
 }
 
-static char *cidr_acl_parse(struct cidr_acl *acl,char *str) {
+static char *cidr_dst_acl_parse(struct cidr_acl *acl,char *str) {
 char *p,*e;
 int r;
 
@@ -1399,6 +1400,39 @@ void ping_it(struct sockaddr_in *caddr,int csock) {
 
 	return;
 }
+void cidr_acl(char *optarg) {
+	struct sockaddr_in addr;
+	struct ping_acl *acl;
+	char *cmd = parse_host_port(&addr,optarg);
+	while(cmd && (*cmd == ',' || !*cmd)) {
+		acl = calloc(1,sizeof(*acl));
+		acl->host = addr;
+		acl->next = ACL;
+		ACL = acl;
+		if(!*cmd) break;
+		cmd = parse_host_port(&addr,cmd+1);
+	}
+	if(*cmd) {
+		fprintf(stderr,"Bad addr %s\n",optarg);
+		exit(1);
+	}
+}
+void cidr_dst_acl(char *optarg) {
+
+		struct cidr_acl dst;
+		char *cmd = cidr_dst_acl_parse(&dst,optarg);
+		while(cmd && (*cmd == ',' || !*cmd)) {
+			struct cidr_acl *acl = calloc(1,sizeof(struct cidr_acl));
+			*acl = dst;
+			acl->next = DST_ACL;
+			DST_ACL = acl;
+			if(!*cmd) break;
+			cmd = cidr_dst_acl_parse(&dst,cmd+1);
+		}
+		if(!cmd || *cmd) {
+			exit(1);
+		}
+}
 
 
 int main(int argc, char *argv[])
@@ -1423,42 +1457,27 @@ int main(int argc, char *argv[])
     caddr.sin_port = htons(19988);
     srandom(getpid());
 
-    while((c=getopt(argc,argv,"4kDd:b:a:A:P:")) != -1) {
+    while((c=getopt(argc,argv,"4kDd:b:a:A:x:P:")) != -1) {
 	switch(c) {
 	    case 'a':
-		    {
-    			struct sockaddr_in addr;
-			struct ping_acl *acl;
-			char *cmd = parse_host_port(&addr,optarg);
-			while(cmd && (*cmd == ',' || !*cmd)) {
-				acl = calloc(1,sizeof(*acl));
-				acl->host = addr;
-				acl->next = ACL;
-				ACL = acl;
-				if(!*cmd) break;
-				cmd = parse_host_port(&addr,cmd+1);
-			}
-			if(*cmd) {
-				fprintf(stderr,"Bad addr %s\n",optarg);
-				exit(1);
-			}
-		    }
-	            break;
+			cidr_acl(optarg);
+            break;
 	    case 'A':
+			cidr_dst_acl(optarg);
+			break;
+	    case 'x':
 		    {
-			struct cidr_acl dst;
-			char *cmd = cidr_acl_parse(&dst,optarg);
-			while(cmd && (*cmd == ',' || !*cmd)) {
-				struct cidr_acl *acl = calloc(1,sizeof(struct cidr_acl));
-				*acl = dst;
-				acl->next = DST_ACL;
-				DST_ACL = acl;
-				if(!*cmd) break;
-				cmd = cidr_acl_parse(&dst,cmd+1);
-			}
-			if(!cmd || *cmd) {
+			FILE *facl = fopen(optarg,"r");
+			if(!facl) {
+				fprintf(stderr,"File %s error %s\n",optarg,strerror(errno));
 				exit(1);
 			}
+			while(fgets(rcv_data,sizeof(rcv_data),facl)) {
+				char *eol = strchr(rcv_data,'\n');
+				if(eol) *eol = '\0';
+				cidr_dst_acl(rcv_data);
+			}
+			fclose(facl);
 		    }
 			break;
 	    case 'b':
@@ -1469,25 +1488,25 @@ int main(int argc, char *argv[])
 				exit(1);
 			}
 		    }
-	            break;
+	        break;
 	    case 'd':
 		    debug_level = strtol(optarg,NULL,16);
-	            break;
+	        break;
 	    case 'D':
 		    do_daemon = 0;
-	            break;
+	        break;
 	    case '4':
 		    ipv4only  = 1;
-	            break;
+	        break;
 	    case 'k':
 		    do_kill = 1;
-	            break;
+	        break;
 	    case 'P':
 		    pid_file = strdup(optarg);
-	            break;
+	        break;
 	    case 'h':
 	    default:
-		      usage();
+		    usage();
 	}
     }
     if(do_kill) {
@@ -1513,6 +1532,8 @@ int main(int argc, char *argv[])
 			perror("malloc");
 			exit(1);
 	}
+	if(!ACL)
+		cidr_acl("127.0.0.1");
 
     sock = socket(AF_INET,SOCK_DGRAM,IPPROTO_ICMP);
     if (sock < 0) {
