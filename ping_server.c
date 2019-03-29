@@ -961,7 +961,7 @@ if(r < 0) {
 }
 if(p) {
 	char *en;
-	addr->sin_port = htons(strtol(p,&en,10) & 0xffff);
+	addr->sin_port = htons(strtol(p+1,&en,10) & 0xffff);
 	if(en && !*en) {
 		if(e) *e = ',';
 		return NULL;
@@ -1483,7 +1483,7 @@ int main(int argc, char *argv[])
 	    case 'b':
 		    {
 			char *cmd = parse_host_port(&caddr,optarg);
-			if(*cmd) {
+			if(cmd && *cmd) {
 				fprintf(stderr,"Bad addr:port %s\n",optarg);
 				exit(1);
 			}
